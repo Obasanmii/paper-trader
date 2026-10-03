@@ -1,0 +1,31 @@
+# The walk-forward ML classifier on the trending market, against the same bar.
+name: demo_ml
+
+data:
+  source: synthetic
+  symbols: [AAA, BBB, CCC, DDD, EEE]
+  synthetic:
+    n_days: 5040
+    start: 2005-01-03
+    seed: 7
+    regime_drift: 0.30
+
+strategy:
+  name: ml_classifier
+  params:
+    horizon: 5
+    train_window: 756
+    retrain_every: 63
+    embargo: 5
+    model: logistic
+
+risk:
+  max_daily_loss_pct: 0.07
+  max_drawdown_pct: 0.35
+  max_order_notional: 250000
+
+research:
+  split_date: 2016-12-30
+  param_grid:
+    threshold: [0.52, 0.55, 0.58]
+    horizon: [5, 20]

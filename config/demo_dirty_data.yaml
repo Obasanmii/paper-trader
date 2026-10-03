@@ -1,0 +1,13 @@
+# Synthetic data with realistic problems planted in it (a 10x bad tick, a
+# duplicate row, a high below the low, a negative volume, a missing close,
+# a stuck feed). Run `python -m papertrader data -c config/demo_dirty_data.yaml`
+# to see the cleaning step catch each one.
+name: demo_dirty_data
+
+data:
+  source: synthetic
+  symbols: [AAA, BBB]
+  synthetic:
+    n_days: 1000
+    seed: 3
+    inject_errors: true

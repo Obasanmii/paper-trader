@@ -1,0 +1,27 @@
+# Paper trading on synthetic data. Walk it forward a day at a time with:
+#   python -m papertrader paper-step -c config/demo_paper.yaml --as-of 2024-01-02
+# (drop --as-of when running for real on live data after the close)
+name: demo_paper
+
+data:
+  source: synthetic
+  symbols: [AAA, BBB, CCC, DDD, EEE]
+  synthetic:
+    n_days: 5040
+    start: 2005-01-03
+    seed: 7
+    regime_drift: 0.30
+
+strategy:
+  name: trend
+  params: {lookback: 100}
+
+risk:
+  max_position_pct: 0.25
+  max_gross_exposure_pct: 1.0
+  max_order_notional: 250000
+  max_daily_loss_pct: 0.07
+  max_drawdown_pct: 0.35
+
+paper:
+  state_dir: state/demo_paper

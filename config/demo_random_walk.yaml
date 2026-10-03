@@ -1,0 +1,40 @@
+# Driftless random walk: there is NOTHING to find here.
+# Any strategy that looks good on this data is overfit by construction.
+# Use it to check that the research protocol says "no" when it should.
+name: demo_random_walk
+
+data:
+  source: synthetic
+  symbols: [AAA, BBB, CCC, DDD, EEE]
+  synthetic:
+    n_days: 5040          # ~20 years of business days
+    start: 2005-01-03
+    seed: 7
+    drift: 0.0
+    regime_drift: 0.0     # no hidden trends
+
+strategy:
+  name: trend
+  params: {}
+
+portfolio:
+  initial_cash: 100000
+  cash_buffer_pct: 0.02
+  rebalance_band: 0.02
+
+costs:
+  commission_bps: 1.0
+  slippage_bps: 5.0
+
+risk:
+  max_position_pct: 0.25
+  max_gross_exposure_pct: 1.0
+  max_order_notional: 250000
+  max_daily_loss_pct: 0.07
+  max_drawdown_pct: 0.35
+
+research:
+  split_date: 2016-12-30  # ~12 years in-sample, ~8 years out-of-sample
+  param_grid:
+    lookback: [10, 20, 40, 60, 100, 150, 200, 250]
+    vol_target: [null, 0.15]

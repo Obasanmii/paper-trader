@@ -1,0 +1,37 @@
+# Real data template. Needs internet and `pip install yfinance`.
+# Better: run scripts/download_yahoo.py once, then switch source to csv so
+# every run uses the same saved data (reproducible, and no rate limits).
+name: etf_trend
+
+data:
+  source: yfinance          # or: csv (reads data/raw/<SYMBOL>.csv)
+  symbols: [SPY, EFA, EEM, TLT, IEF, GLD, DBC, VNQ]
+  start: 2007-01-01
+  csv_dir: data/raw
+
+strategy:
+  name: trend
+  params: {lookback: 200}
+
+portfolio:
+  initial_cash: 100000
+
+costs:
+  commission_bps: 1.0
+  slippage_bps: 5.0
+
+risk:
+  max_position_pct: 0.20
+  max_gross_exposure_pct: 1.0
+  max_order_notional: 50000
+  max_daily_loss_pct: 0.05
+  max_drawdown_pct: 0.25
+  symbol_whitelist: [SPY, EFA, EEM, TLT, IEF, GLD, DBC, VNQ]
+
+research:
+  split_date: 2018-12-31
+  param_grid:
+    lookback: [50, 100, 150, 200, 250]
+
+paper:
+  state_dir: state/etf_trend
