@@ -31,7 +31,7 @@ CHECKS = [
     ("naive_psr", "In-sample winner 'significant' (PSR >= 0.95, no correction)"),
     ("deflated_sharpe", "Still significant after deflating for the number of trials"),
     ("oos_interval_above_zero", "Out-of-sample Sharpe interval above zero"),
-    ("beats_benchmark_oos", "Beats the benchmark out-of-sample"),
+    ("beats_benchmark_oos", "Beats the benchmark out-of-sample (paired bootstrap)"),
     ("timing", "Timing beats shifted copies (p < 0.05)"),
     ("all", "Passes every protocol check"),
 ]
@@ -53,7 +53,7 @@ def main() -> int:
                 research=dataclasses.replace(base.research, bootstrap_samples=500, timing_permutations=200),
             )
             data, _ = load_market_data(cfg.data)
-            res = run_research(data, cfg)
+            res = run_research(data, cfg, ledger=None)  # independent markets: no shared trial history
             row = dict(res.check_results)
             row["naive_psr"] = res.psr_in >= 0.95
             row["all"] = res.passed == res.checks

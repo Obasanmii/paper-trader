@@ -20,11 +20,17 @@ class Broker(ABC):
 
     @abstractmethod
     def process_open(self, at, open_prices: dict[str, float]) -> tuple[list[Fill], list[tuple[Order, str]]]:
-        """Called at each session open. Returns (fills, [(cancelled order, why)])."""
+        """Called at each session open. Returns (fills, [(cancelled order, why)]).
+
+        A partial fill leaves the order PARTIAL and also returns its unfilled
+        remainder as a cancelled Order with the same order_id, so nothing an order
+        asked for disappears without a line in the journal.
+        """
 
     @abstractmethod
     def cancel_pending(self, predicate: Callable[[Order], bool], why: str) -> list[tuple[Order, str]]:
-        """Cancel queued orders matching `predicate`."""
+        """Cancel queued orders matching `predicate`. Used for risk vetoes at the open
+        (kill switch, price collar); returns [(cancelled order, why)]."""
 
     @abstractmethod
     def snapshot(self, marks: dict[str, float]) -> PortfolioSnapshot:

@@ -23,9 +23,14 @@ class DataSource(ABC):
 
 
 def _slice(df: pd.DataFrame, start, end) -> pd.DataFrame:
-    start = None if start is None else pd.Timestamp(start)
-    end = None if end is None else pd.Timestamp(end)
-    return df.loc[start:end]
+    """A mask, not a label slice: label slicing raises on unsorted dates, which
+    cleaning should get to sort and record instead."""
+    keep = np.ones(len(df), dtype=bool)
+    if start is not None:
+        keep &= df.index >= pd.Timestamp(start)
+    if end is not None:
+        keep &= df.index <= pd.Timestamp(end)
+    return df.loc[keep]
 
 
 def normalise(df: pd.DataFrame, adjust: bool = True) -> pd.DataFrame:
@@ -164,7 +169,7 @@ class SyntheticSource(DataSource):
         n = len(df)
         # One spot per segment so planted problems never overlap each other.
         bounds = np.linspace(60, n - 60, 7).astype(int)
-        spots = [int(rng.integers(lo, max(lo + 1, hi - 10))) for lo, hi in zip(bounds[:-1], bounds[1:])]
+        spots = [int(rng.integers(lo, max(lo + 1, hi - 10))) for lo, hi in zip(bounds[:-1], bounds[1:], strict=True)]
         c = {name: df.columns.get_loc(name) for name in df.columns}
         i_tick, i_high, i_vol, i_nan, i_stale, i_dup = (int(s) for s in spots)
         df.iloc[i_tick, c["close"]] *= 10.0  # fat-finger print that reverts next day
@@ -192,10 +197,14 @@ class YFinanceSource(DataSource):
             import yfinance as yf
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise ImportError("yfinance is not installed: pip install yfinance (or use the csv source)") from exc
+        # history(end=...) is exclusive, but a config end date means "up to and including".
+        stop = None if end is None else (pd.Timestamp(end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
         out = {}
         for sym in symbols:
-            hist = yf.Ticker(sym).history(start=start, end=end, auto_adjust=True)
+            hist = yf.Ticker(sym).history(start=start, end=stop, auto_adjust=True)
             if hist is None or hist.empty:
                 raise ValueError(f"yfinance returned no data for {sym}")
-            out[sym] = normalise(hist, adjust=False)  # auto_adjust=True already adjusted OHLC
+            # auto_adjust=True already adjusted OHLC. Slice on local dates in case the
+            # extra day lets a bar past `end` through (yfinance timezone handling varies).
+            out[sym] = _slice(normalise(hist, adjust=False), start, end)
         return out

@@ -10,6 +10,10 @@ echo "== 1. Tests: risk limits, kill switch, no-lookahead contract, paper == bac
 echo; echo "== 2. Data cleaning catches planted errors"
 $PT data -c config/demo_dirty_data.yaml
 
+# The demo configs keep their own trial ledger (research.ledger_path), reset here so the tour always
+# shows first-look verdicts. Never do this to a real research ledger: it is what keeps the trial count honest.
+rm -f state/demo_ledger.sqlite
+
 echo; echo "== 3. Research on pure noise: the protocol should say no"
 $PT research -c config/demo_random_walk.yaml
 

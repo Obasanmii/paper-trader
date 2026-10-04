@@ -5,6 +5,8 @@ Checks, in order, per symbol:
   2. drop rows with missing / non-positive prices
   3. zero out negative or missing volume
   4. drop one-day close spikes that fully revert the next day (bad ticks)
+     (live only, hold_unconfirmed) hold back a newest bar whose close moved
+     more than the spike threshold: nothing can confirm it until the next bar
   5. repair open spikes that revert by the close (open := previous close)
   6. cap absurd high/low wicks at the candle body
   7. widen high/low so they contain open and close
@@ -16,12 +18,19 @@ for *marking only*: close is carried forward, open is left NaN so nothing
 can trade on a day that didn't happen. Nothing is ever back-filled, since
 back-filling copies future prices into the past.
 
-A note on lookahead: checks 4 and 5 look one bar ahead to confirm a tick
-reverted. That's fine for historical research data (the bad print was never
-a real price), but it means the live runner can't confirm a spike on the
-newest bar. There, the risk layer's price-deviation and daily-loss limits
-are the backstop. The paper runner cleans data truncated to the current day,
-so it only ever uses what it could have known.
+A note on lookahead: check 4 looks one bar ahead to confirm a tick reverted
+(checks 5-7 only look within the same bar). That's fine for historical
+research data (the bad print was never a real price), but on the newest bar
+there is no next bar yet, so a bad tick can't be told from a real move. One
+10x print there nearly tripled marked equity for a day, and the next day's
+apparent loss tripped the kill switch and liquidated the account. So live
+callers pass `hold_unconfirmed=True`: a big move on the newest bar is held
+back (`unconfirmed_move`). After alignment that day is an ordinary filled
+gap, marked at the last good close and untradable (or absent, if no other
+symbol traded it). A day later check 4 either drops the bar as a bad tick or
+keeps it as a large move. Risk limits stay a second line of defence, not
+the first. The paper runner cleans data truncated to the current day, so it
+only ever uses what it could have known.
 """
 from __future__ import annotations
 
@@ -78,8 +87,14 @@ def clean_symbol(
     report: CleaningReport,
     spike_threshold: float = 0.25,
     stale_run: int = 5,
+    hold_unconfirmed: bool = False,
 ) -> pd.DataFrame:
-    """Clean one symbol's bars. `spike_threshold` is an absolute log return (0.25 ~ 28%)."""
+    """Clean one symbol's bars. `spike_threshold` is an absolute log return (0.25 ~ 28%).
+
+    `hold_unconfirmed` is for live use, where the newest bar is today's: see the
+    lookahead note above. Leave it off for historical data, which then cleans
+    exactly as before.
+    """
     df = df.copy()
     df.index = pd.DatetimeIndex(pd.to_datetime(df.index))
 
@@ -118,6 +133,8 @@ def clean_symbol(
     for d in df.index[spike]:
         report.add(symbol, d, "price_spike", "dropped row (reverted next day: bad tick)", f"{r[d]:+.2f} then {nxt[d]:+.2f} log")
     df = df.loc[~spike].copy()
+    if hold_unconfirmed:
+        df = _hold_back_newest(df, symbol, report, spike_threshold)
 
     # 5. open spikes that revert by the close
     prev_close = df["close"].shift(1)
@@ -170,15 +187,36 @@ def clean_symbol(
     return df
 
 
+def _hold_back_newest(df: pd.DataFrame, symbol: str, report: CleaningReport, spike_threshold: float) -> pd.DataFrame:
+    """Check 4 can't judge the newest bar, so a big move there waits one day.
+    Marking at yesterday's close for a day is cheap; trading on a bad tick isn't."""
+    if len(df) < 2:
+        return df  # no previous close to measure the move against
+    prev, last = df["close"].iloc[-2], df["close"].iloc[-1]
+    move = float(np.log(last / prev))
+    if abs(move) <= spike_threshold:
+        return df
+    report.add(
+        symbol,
+        df.index[-1],
+        "unconfirmed_move",
+        f"held back: newest bar moved {move:+.2f} log and can't be confirmed until the next bar",
+        f"close {last:.4g} vs previous {prev:.4g}",
+    )
+    return df.iloc[:-1].copy()
+
+
 def align(frames: dict[str, pd.DataFrame], report: CleaningReport, max_ffill_days: int = 3) -> MarketData:
-    """Put every symbol on one calendar. Short gaps are marked-to-last-close, never traded."""
+    """Put every symbol on one calendar. Short gaps are marked-to-last-close, never traded.
+    `max_ffill_days=0` fills nothing: a day without a bar has no mark either."""
     if not frames:
         raise ValueError("no data to align")
     calendar = pd.DatetimeIndex(sorted(set().union(*[f.index for f in frames.values()])))
     panels = {f: {} for f in FIELDS}
+    too_long_why = f"gap longer than {max_ffill_days} days" if max_ffill_days else "forward fill is off"
     for sym, df in frames.items():
         df = df.reindex(calendar)
-        close_ff = df["close"].ffill(limit=max_ffill_days)
+        close_ff = df["close"].ffill(limit=max_ffill_days) if max_ffill_days else df["close"]  # pandas rejects limit=0
         filled = df["close"].isna() & close_ff.notna()
         for d in calendar[filled.to_numpy()]:
             report.add(sym, d, "gap_filled", "close carried forward; open left empty (untradable)")
@@ -189,7 +227,7 @@ def align(frames: dict[str, pd.DataFrame], report: CleaningReport, max_ffill_day
         inside = (calendar >= first_valid) & (calendar <= last_valid)
         too_long = (df["close"].isna() & close_ff.isna()).to_numpy() & inside
         for d in calendar[too_long]:
-            report.add(sym, d, "gap_too_long", f"left empty (gap longer than {max_ffill_days} days)")
+            report.add(sym, d, "gap_too_long", f"left empty ({too_long_why})")
         df = df.copy()
         df["close"] = close_ff
         df.loc[filled, "high"] = close_ff[filled]

@@ -45,9 +45,11 @@ def _cmd_backtest(cfg, args) -> int:
     strategy = build_strategy(cfg.strategy.name, cfg.strategy.params)
     journal = Journal(out / "journal.sqlite")
     common = dict(portfolio=cfg.portfolio, costs=cfg.costs, limits=cfg.risk, start=start)
-    result = run_backtest(data, strategy, journal=journal, config=config_to_dict(cfg), **common)
+    try:  # close (which commits) even on failure: the rows up to the error are what a post-mortem needs
+        result = run_backtest(data, strategy, journal=journal, config=config_to_dict(cfg), **common)
+    finally:
+        journal.close()
     bench = run_backtest(data, build_strategy(cfg.research.benchmark, {}), **common)
-    journal.close()
     r = result.returns()
     validation = {
         "psr": probabilistic_sharpe_ratio(r),
@@ -71,26 +73,37 @@ def _cmd_research(cfg, args) -> int:
 
     out = Path(args.out or Path("reports") / cfg.name / "research")
     data, cleaning = load_market_data(cfg.data)
-    res = run_research(data, cfg)
+    res = run_research(data, cfg, ledger=cfg.research.ledger_path)
     path = research_report(cfg, res, cleaning, out)
-    print(f"{res.strategy}: {len(res.trials)} trials in-sample, best = {res.best.params}")
+    earlier = f"; earlier runs tried {res.n_trials_prior} more" if res.n_trials_prior else ""
+    print(f"{res.strategy}: {len(res.trials)} trials in-sample, best = {res.best.params}{earlier}")
     for line in res.verdict:
         print("  " + line)
     print(f"Report: {path}")
+    if res.ledger_run_id is None:
+        print("Trial ledger: off (research.ledger_path is null)")
+    else:
+        print(f"Trial ledger: {cfg.research.ledger_path} (this run: {res.ledger_run_id})")
     return 0
 
 
 def _cmd_paper_step(cfg, args) -> int:
     from papertrader.paper import PaperRunner
+    from papertrader.utils import is_valid_price
 
-    results = PaperRunner(cfg).step(as_of=args.as_of, force=args.force)
+    runner = PaperRunner(cfg)
+    results = runner.step(as_of=args.as_of, force=args.force, accept_config_change=args.accept_config_change)
+    for event in runner.step_events:  # found before the first day: config changes, corporate actions
+        print(f"RISK EVENT: {event.kind}: {event.detail}")
     if not results:
-        print("Nothing to do: already processed the latest trading day.")
+        print("Nothing to do: already processed the latest complete trading day.")
         return 0
     for day in results:
         flags = " [KILL SWITCH ON]" if day.kill_switch else ""
+        # A wiped-out or unvaluable account is exactly when this line must still print.
+        gross = f"{day.gross_exposure / day.equity:6.1%}" if is_valid_price(day.equity) else "   n/a"
         print(
-            f"{day.date.date()}  equity {day.equity:>12,.2f}  gross {day.gross_exposure / day.equity:6.1%}  "
+            f"{day.date.date()}  equity {day.equity:>12,.2f}  gross {gross}  "
             f"fills {len(day.fills)}  approved {len(day.approved)}  rejected {len(day.rejected)}{flags}"
         )
         for event in day.events:
@@ -127,10 +140,11 @@ def _cmd_reset_kill(cfg, args) -> int:
     if not args.yes_i_checked:
         print("Refusing: pass --yes-i-checked once you've looked at why it tripped (see the journal's risk_events).")
         return 1
-    switch = PaperRunner(cfg).kill_switch()
-    before = switch.status()
-    switch.reset(confirm=True)
-    print(f"Kill switch reset. It had tripped at {before['at']}: {before['reason']}")
+    before = PaperRunner(cfg).reset_kill_switch()  # under the run lock: never in the middle of a step
+    if before["tripped"]:
+        print(f"Kill switch reset. It had tripped at {before['at']}: {before['reason']}")
+    else:
+        print("Kill switch was not tripped; nothing to reset.")
     return 0
 
 
@@ -156,6 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "paper-step":
             p.add_argument("--as-of", help="simulate running on this date (YYYY-MM-DD)")
             p.add_argument("--force", action="store_true", help="allow catching up more than paper.max_catchup_days")
+            p.add_argument(
+                "--accept-config-change",
+                action="store_true",
+                help="adopt a changed data/strategy/portfolio/costs/risk config (journaled as a risk event)",
+            )
         if name == "kill":
             p.add_argument("--reason", required=True)
         if name == "reset-kill":
@@ -172,8 +191,11 @@ def main(argv=None) -> int:
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, sys.stdout.fileno())
         return 0
-    except (ConfigError, FileNotFoundError, RuntimeError, ValueError, PermissionError) as exc:
+    except (ConfigError, OSError, RuntimeError, ValueError) as exc:  # OSError: missing file, a directory, no permission
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except KeyError as exc:  # e.g. a held position with no valid mark: a data problem, not a bug
+        print(f"error: {exc.args[0] if exc.args else exc}", file=sys.stderr)  # str(KeyError) adds quotes
         return 1
 
 

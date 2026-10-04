@@ -1,8 +1,9 @@
 """The risk manager: the only gate between decisions and the broker.
 
 It knows nothing about strategies. It sees proposed orders, the portfolio and
-the latest marks, and it can do three things: approve an order, reject it
-with reasons, or trip the kill switch.
+the latest marks, and it can do four things: approve an order, reject it
+with reasons, flag a queued order for cancellation when the open has run
+away from the price it was decided on, or trip the kill switch.
 
 Design rules:
   * Fail closed. Missing prices, NaN quantities, unknown symbols and missing
@@ -60,6 +61,8 @@ class RiskManager:
         self.kill_switch = kill_switch if kill_switch is not None else KillSwitch()
         self.peak_equity: float | None = None
         self.last_close_equity: float | None = None
+        self.gain_unconfirmed = False  # the gain limit has kept a close out of the base; see end_of_day
+        self.unconfirmed_equity: float | None = None  # the latest close it kept out: what a reset confirms
         self.current_day: pd.Timestamp | None = None
         self.orders_today = 0
         self.events: list[RiskEvent] = []
@@ -72,14 +75,70 @@ class RiskManager:
             self.orders_today = 0
 
     def end_of_day(self, day, equity: float) -> list[RiskEvent]:
-        """Check loss limits at the close. May trip the kill switch."""
+        """Check loss limits, and the gain limit, at the close. May trip the kill switch.
+
+        A close the gain limit doesn't believe never becomes the base (gain_unconfirmed).
+        If the jump was real, every later close repeats it, so once a person has checked
+        the trip and reset the switch, the next close is accepted as the base instead
+        (a 'gain_accepted' event); otherwise each reset would be undone at the next close,
+        forever. The reset confirms the close the person looked at (unconfirmed_equity), so
+        the accepted close is still measured against that: another implausible gain is held
+        back again, and a loss beyond the daily limit trips. The drawdown is still checked.
+        """
         new: list[RiskEvent] = []
         L = self.limits
         if not math.isfinite(equity) or equity <= 0:
             new.append(self._trip(day, f"equity is {equity!r}"))
         else:
-            if self.last_close_equity:
-                change = equity / self.last_close_equity - 1
+            base = self.last_close_equity
+            change = equity / base - 1 if base else None
+            if self.gain_unconfirmed and not self.kill_switch.tripped:
+                recorded = is_valid_price(self.unconfirmed_equity)
+                confirmed = self.unconfirmed_equity if recorded else base
+                since = equity / confirmed - 1 if confirmed else None
+                ref = (
+                    "since the close confirmed by the last reset"
+                    if recorded
+                    else "since the last accepted close (the close the reset confirmed isn't recorded: "
+                    "reset again if this level is real)"
+                )
+                if since is not None and L.max_daily_gain_pct is not None and since >= L.max_daily_gain_pct:
+                    # Another implausible jump on top of the one just confirmed: hold it back too.
+                    self.unconfirmed_equity = equity
+                    event = self._trip(
+                        day,
+                        f"daily gain {since:+.2%} {ref} exceeds the {L.max_daily_gain_pct:.0%} limit: marks look like bad data",
+                    )
+                    return [] if event is None else [event]
+                self.gain_unconfirmed, self.unconfirmed_equity = False, None
+                was = f"{base:,.2f}" if is_valid_price(base) else "unset"
+                event = RiskEvent(
+                    pd.Timestamp(day),
+                    "gain_accepted",
+                    f"kill switch reset after the gain limit tripped: equity {equity:,.2f} accepted as the base (was {was})",
+                )
+                self.events.append(event)
+                new.append(event)
+                if is_valid_price(confirmed):
+                    self.peak_equity = confirmed if self.peak_equity is None else max(self.peak_equity, confirmed)
+                if since is not None and since <= -L.max_daily_loss_pct:
+                    why = f"loss {since:.2%} {ref} breached the {L.max_daily_loss_pct:.0%} daily limit"
+                    new.append(self._trip(day, why))
+            elif change is not None:
+                if L.max_daily_gain_pct is not None and change >= L.max_daily_gain_pct:
+                    # Don't let an equity we don't believe become the peak or the base for
+                    # tomorrow's change: a normal close after it would read as a crash.
+                    held = self.unconfirmed_equity if self.gain_unconfirmed else None
+                    if not (is_valid_price(held) and equity / held - 1 >= L.max_daily_gain_pct):
+                        # The close a reset will confirm: the latest one held back, but never an
+                        # implausible jump over the close already held back (a bad print while tripped).
+                        self.unconfirmed_equity = equity
+                    self.gain_unconfirmed = True  # also if already tripped: a reset must re-base, see above
+                    event = self._trip(
+                        day, f"daily gain {change:+.2%} exceeds the {L.max_daily_gain_pct:.0%} limit: marks look like bad data"
+                    )
+                    return [] if event is None else [event]
+                self.gain_unconfirmed, self.unconfirmed_equity = False, None  # an ordinary close: it was a bad tick after all
                 if change <= -L.max_daily_loss_pct:
                     new.append(self._trip(day, f"daily loss {change:.2%} breached the {L.max_daily_loss_pct:.0%} limit"))
             self.peak_equity = equity if self.peak_equity is None else max(self.peak_equity, equity)
@@ -105,11 +164,12 @@ class RiskManager:
         equity = math.nan if missing else snapshot.equity
         results = []
         for order in ordered:
+            reducing = is_reducing(positions.get(order.symbol, 0.0), order.quantity)
             decision = self._check_one(order, positions, snapshot.prices, equity, missing, now, data_as_of)
+            if not reducing:
+                self.orders_today += 1  # rejected ones too: a loop proposing junk is still a runaway loop
             if decision.approved:
                 positions[order.symbol] = positions.get(order.symbol, 0.0) + order.quantity
-                if not decision.reducing:
-                    self.orders_today += 1
             results.append((order, decision))
         return results
 
@@ -142,6 +202,9 @@ class RiskManager:
             reasons.append(f"{sym} is not on the symbol whitelist")
         if self.orders_today >= L.max_orders_per_day:
             reasons.append(f"daily order limit reached ({L.max_orders_per_day})")
+        # Only catches a stale or wrong reference price at decision time. The engine prices
+        # orders off the same closes as the marks, so there this is always 0; the collar
+        # that matters there is check_open, against the open the order will actually fill at.
         deviation = abs(ref / px - 1)
         if deviation > L.max_price_deviation_pct:
             reasons.append(f"reference price {ref:.4g} is {deviation:.1%} away from market {px:.4g}")
@@ -177,6 +240,49 @@ class RiskManager:
                     )
         return RiskDecision(not reasons, reasons, reducing=False)
 
+    def check_open(
+        self, pending: list[Order], positions: dict[str, float], open_prices: dict[str, float]
+    ) -> list[tuple[Order, str]]:
+        """The price collar: queued orders that must not fill at this open, as [(order, why)].
+
+        Orders are decided on a close and filled at the next open, so the overnight
+        gap is the one price move the decision never saw. A new-risk order whose open
+        is more than max_price_deviation_pct from its decision price is no longer the
+        trade that was approved. Exposure-reducing orders are exempt: you must always
+        be able to get out, gap or no gap.
+        """
+        positions = dict(positions)
+        flagged = []
+        for order in sorted(pending, key=lambda o: 0 if is_reducing(positions.get(o.symbol, 0.0), o.quantity) else 1):
+            current = positions.get(order.symbol, 0.0)
+            if not is_reducing(current, order.quantity):
+                why = self._open_problem(order, open_prices.get(order.symbol))
+                if why is not None:
+                    flagged.append((order, why))
+                    continue
+            positions[order.symbol] = current + float(order.quantity)  # as in check_orders: project the batch
+        return flagged
+
+    def _open_problem(self, order: Order, open_price) -> str | None:
+        """Why a new-risk order can't fill at this open, or None. Bad inputs fail closed."""
+        L, ref = self.limits, order.reference_price
+        try:
+            q = float(order.quantity)
+        except (TypeError, ValueError):
+            q = math.nan
+        if not math.isfinite(q) or q == 0:
+            return f"invalid quantity {order.quantity!r}"
+        if not is_valid_price(ref):
+            return f"invalid reference price {ref!r}: can't check the open against it"
+        if not is_valid_price(open_price):
+            return f"no tradable open price for {order.symbol} today"
+        px, ref = float(open_price), float(ref)
+        deviation = abs(px / ref - 1)
+        if deviation > L.max_price_deviation_pct:
+            limit = L.max_price_deviation_pct
+            return f"open {px:.6g} is {deviation:.1%} away from the decision price {ref:.6g} (limit {limit:.0%})"
+        return None
+
     def flatten_orders(self, snapshot: PortfolioSnapshot, at) -> list[Order]:
         """Orders that close every open position (used after the kill switch trips)."""
         return [
@@ -190,6 +296,8 @@ class RiskManager:
         return {
             "peak_equity": self.peak_equity,
             "last_close_equity": self.last_close_equity,
+            "gain_unconfirmed": self.gain_unconfirmed,
+            "unconfirmed_equity": self.unconfirmed_equity,
             "current_day": None if self.current_day is None else str(self.current_day.date()),
             "orders_today": self.orders_today,
         }
@@ -199,6 +307,9 @@ class RiskManager:
             return
         self.peak_equity = state.get("peak_equity")
         self.last_close_equity = state.get("last_close_equity")
+        self.gain_unconfirmed = state.get("gain_unconfirmed") is True  # anything else: check gains as usual
+        unconfirmed = state.get("unconfirmed_equity")
+        self.unconfirmed_equity = float(unconfirmed) if is_valid_price(unconfirmed) else None
         day = state.get("current_day")
         self.current_day = None if day is None else pd.Timestamp(day)
         self.orders_today = int(state.get("orders_today", 0))

@@ -17,6 +17,8 @@ __all__ = [
     "YFinanceSource",
     "build_source",
     "load_market_data",
+    "load_raw",
+    "prepare_market_data",
 ]
 
 
@@ -42,18 +44,35 @@ def build_source(data_cfg) -> DataSource:
     raise ValueError(f"unknown data source {data_cfg.source!r}")
 
 
-def load_market_data(data_cfg, as_of=None, source: DataSource | None = None) -> tuple[MarketData, CleaningReport]:
-    """Load, clean and align. With `as_of`, raw data is cut *before* cleaning,
-    so a simulated live day only ever sees what it could have known."""
+def load_raw(data_cfg, source: DataSource | None = None) -> dict[str, pd.DataFrame]:
+    """Download once. prepare_market_data can then clean any number of cut-offs
+    from the same bars, e.g. each catch-up day exactly as it looked on the day."""
     source = source or build_source(data_cfg)
-    raw = source.load(list(data_cfg.symbols), data_cfg.start, data_cfg.end)
+    return source.load(list(data_cfg.symbols), data_cfg.start, data_cfg.end)
+
+
+def prepare_market_data(
+    raw: dict[str, pd.DataFrame], data_cfg, as_of=None, hold_unconfirmed: bool = False
+) -> tuple[MarketData, CleaningReport]:
+    """Clean and align `raw` without modifying it. With `as_of`, raw data is cut
+    *before* cleaning, so a simulated live day only ever sees what it could have
+    known. `hold_unconfirmed` is for live use (see clean_symbol)."""
     if as_of is not None:
         cutoff = pd.Timestamp(as_of)
         raw = {sym: df.loc[pd.DatetimeIndex(pd.to_datetime(df.index)) <= cutoff] for sym, df in raw.items()}
     report = CleaningReport()
     c = data_cfg.cleaning
     cleaned = {
-        sym: clean_symbol(df, sym, report, spike_threshold=c.spike_threshold, stale_run=c.stale_run)
+        sym: clean_symbol(
+            df, sym, report, spike_threshold=c.spike_threshold, stale_run=c.stale_run, hold_unconfirmed=hold_unconfirmed
+        )
         for sym, df in raw.items()
     }
     return align(cleaned, report, max_ffill_days=c.max_ffill_days), report
+
+
+def load_market_data(
+    data_cfg, as_of=None, source: DataSource | None = None, hold_unconfirmed: bool = False
+) -> tuple[MarketData, CleaningReport]:
+    """Load, clean and align in one go: prepare_market_data(load_raw(...))."""
+    return prepare_market_data(load_raw(data_cfg, source), data_cfg, as_of=as_of, hold_unconfirmed=hold_unconfirmed)

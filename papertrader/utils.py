@@ -4,8 +4,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import socket
 import tempfile
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
 
@@ -41,22 +43,77 @@ def read_json(path: str | Path):
 
 @contextmanager
 def run_lock(path: str | Path):
-    """Refuse to run twice at once against the same state directory."""
+    """Refuse to run twice at once against the same state directory.
+
+    The lock is an OS advisory lock on `path` (flock on POSIX, msvcrt.locking on
+    Windows), and the file is never deleted. The kernel releases the lock when its
+    holder exits, however it dies (kill -9, power loss), so a crash can't leave a
+    stale lock behind, and nothing has to guess from a recorded pid whether the
+    holder is still alive (a guess that goes wrong across PID namespaces). The
+    holder's pid, host and start time are written into the file only to say who
+    holds it.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)  # no O_TRUNC: the holder's details stay readable
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        raise RuntimeError(
-            f"{path} exists: another run may be in progress. "
-            "If you're sure nothing else is running, delete it and retry."
-        ) from None
-    try:
-        os.write(fd, str(os.getpid()).encode())
-        yield
+        if not _try_lock(fd):
+            raise RuntimeError(
+                f"{path} is locked by {_holder(fd)}: another run may be in progress. "
+                "Wait for it to finish; the lock is released when that process exits."
+            )
+        try:
+            me = {"pid": os.getpid(), "host": socket.gethostname(), "started": datetime.now().astimezone().isoformat()}
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, json.dumps(me).encode())
+            yield
+        finally:
+            _unlock(fd)
     finally:
         os.close(fd)
+
+
+# Windows locks are mandatory: lock a byte far past the holder's details, so they stay readable.
+_WINDOWS_LOCK_OFFSET = 1 << 30
+
+
+def _try_lock(fd: int) -> bool:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
         try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _unlock(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _holder(fd: int) -> str:
+    """Who holds the lock, as its holder recorded it (for the error message only)."""
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        holder = json.loads(os.read(fd, 4096).decode())
+        return f"process {holder['pid']} on {holder['host']} (started {holder['started']})"
+    except (OSError, ValueError, TypeError, KeyError):
+        return "another process"

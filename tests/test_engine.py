@@ -1,12 +1,11 @@
 import dataclasses
 
 import numpy as np
-import pandas as pd
 import pytest
 
 from conftest import make_config
 from papertrader.cli import main as cli
-from papertrader.data import load_market_data
+from papertrader.data import MarketData, load_market_data
 from papertrader.engine import run_backtest
 from papertrader.journal import Journal
 from papertrader.paper import PaperRunner
@@ -51,6 +50,30 @@ def test_crash_trips_kill_switch_and_flattens(data):
     assert (after["quantity"] < 0).all() and len(after) > 0  # only selling after the trip
     assert res.gross_exposure.iloc[-1] == 0  # flat
     assert res.equity.iloc[-50:].nunique() == 1  # and staying flat
+
+
+def test_journal_drawdown_is_measured_from_the_risk_managers_peak(data, tmp_path):
+    """The session used to keep its own peak, including an equity the daily gain limit had
+    refused to believe: one bad mark left the journal showing a ~40% drawdown for good."""
+    cfg = make_config()
+    bad_day = data.dates[400]
+    close = data.close.copy()
+    close.loc[bad_day, "AAA"] *= 3.0  # one bad mark, gone the next day
+    spiked = MarketData(open=data.open, high=data.high, low=data.low, close=close, volume=data.volume)
+    journal = Journal(tmp_path / "j.sqlite")
+    res = backtest(spiked, cfg, "equal_weight", start=data.dates[252], journal=journal)
+    journal.close()
+    [event] = res.risk_events
+    assert event.timestamp == bad_day and event.detail.startswith("daily gain")
+
+    j = Journal(tmp_path / "j.sqlite")
+    logged = j.query("select date, equity, drawdown from equity order by date").set_index("date")
+    j.close()
+    believed = logged["equity"].where(logged.index != str(bad_day.date()))  # what the gain limit kept out
+    peak = believed.cummax().ffill()
+    np.testing.assert_allclose(logged["drawdown"], logged["equity"] / peak - 1, rtol=0, atol=1e-12)
+    after = logged.loc[logged.index > str(bad_day.date()), "drawdown"]
+    assert after.min() > -0.10  # no phantom drawdown from the spike's peak
 
 
 def test_paper_trading_replays_the_backtest_exactly(tmp_path):

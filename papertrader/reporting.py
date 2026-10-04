@@ -58,7 +58,10 @@ def plot_equity(curves: dict[str, pd.Series], path: Path, title: str, marks: dic
     for label, when in (marks or {}).items():
         for ax in (ax1, ax2):
             ax.axvline(when, color="grey", linestyle="--", linewidth=0.9)
-        ax1.annotate(label, (when, ax1.get_ylim()[1]), fontsize=8, color="grey", va="top", ha="left", xytext=(3, -3), textcoords="offset points")
+        ax1.annotate(
+            label, (when, ax1.get_ylim()[1]), fontsize=8, color="grey", va="top", ha="left",
+            xytext=(3, -3), textcoords="offset points",
+        )
     ax1.set_yscale("log")
     ax1.yaxis.set_major_formatter(_PLAIN)
     ax1.yaxis.set_minor_formatter(_PLAIN)
@@ -77,7 +80,8 @@ def plot_equity(curves: dict[str, pd.Series], path: Path, title: str, marks: dic
 def backtest_report(cfg, result, bench, validation: dict, cleaning, out_dir: str | Path) -> Path:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    plot_equity({result.name: result.equity, f"benchmark: {bench.name}": bench.equity}, out / "equity.png", f"{cfg.name}: backtest")
+    curves = {result.name: result.equity, f"benchmark: {bench.name}": bench.equity}
+    plot_equity(curves, out / "equity.png", f"{cfg.name}: backtest")
     s, b = result.summary(), bench.summary()
     lo, hi = validation["sharpe_ci"]
     timing = validation["timing"]
@@ -123,11 +127,12 @@ def research_report(cfg, res, cleaning, out_dir: str | Path) -> Path:
     oos_curve = res.out_of_sample.equity
     # One continuous line: IS curve, then the OOS run rescaled to start where IS ended.
     joined = pd.concat([is_curve, oos_curve / oos_curve.iloc[0] * is_curve.iloc[-1]])
-    bench = pd.concat([res.benchmark_in.equity, res.benchmark_out.equity / res.benchmark_out.equity.iloc[0] * res.benchmark_in.equity.iloc[-1]])
+    bench_in, bench_out = res.benchmark_in.equity, res.benchmark_out.equity
+    bench = pd.concat([bench_in, bench_out / bench_out.iloc[0] * bench_in.iloc[-1]])
     plot_equity(
         {f"best: {_params(res.best.params)}": joined, "benchmark": bench},
         out / "research.png",
-        f"{cfg.name}: {res.strategy}, best of {len(res.trials)} in-sample, then out-of-sample",
+        f"{cfg.name}: {res.strategy}, {_best_of(res)}, then out-of-sample",
         marks={"out-of-sample starts": oos_curve.index[0]},
     )
     trials = sorted(res.trials, key=lambda t: -t.sharpe if math.isfinite(t.sharpe) else math.inf)
@@ -137,11 +142,12 @@ def research_report(cfg, res, cleaning, out_dir: str | Path) -> Path:
         f"Strategy `{res.strategy}`. In-sample {res.eval_start.date()} to {res.split_date.date()}; "
         f"out-of-sample {oos_curve.index[0].date()} to {oos_curve.index[-1].date()}.",
         "",
+        *_ledger_note(res),
         "![research](research.png)",
         "",
         "## Verdict",
         "",
-        *[f"- {line}" for line in res.verdict],
+        *[f"- **{line}**" if line.startswith("WARN") else f"- {line}" for line in res.verdict],
         "",
         "## In-sample vs out-of-sample",
         "",
@@ -153,8 +159,7 @@ def research_report(cfg, res, cleaning, out_dir: str | Path) -> Path:
             }
         ),
         "",
-        f"## All {len(trials)} in-sample trials",
-        "",
+        *_trials_heading(res),
         "| Params | Sharpe | Total return | Max drawdown | Kill switch |",
         "|---|---|---|---|---|",
         *[
@@ -173,6 +178,37 @@ def research_report(cfg, res, cleaning, out_dir: str | Path) -> Path:
     path = out / "report.md"
     path.write_text("\n".join(lines))
     return path
+
+
+def _best_of(res) -> str:
+    """The best is picked from this run's grid; earlier runs' trials only raise the deflation bar."""
+    if not res.n_trials_prior:
+        return f"best of {len(res.trials)} in-sample"
+    return f"best of this run's {len(res.trials)} in-sample (deflated for {res.n_trials_total} tried)"
+
+
+def _ledger_note(res) -> list[str]:
+    if res.ledger_run_id is None:
+        return ["Trial ledger: off. Trials and out-of-sample looks from earlier runs are not counted.", ""]
+    return [
+        f"Trial ledger: {res.n_trials_total} distinct parameter set(s) tried on this strategy and data so far; "
+        f"earlier runs had evaluated an overlapping out-of-sample period {res.oos_prior_evaluations} time(s). "
+        f"This run is `{res.ledger_run_id}`.",
+        "",
+    ]
+
+
+def _trials_heading(res) -> list[str]:
+    if not res.n_trials_prior:
+        return [f"## All {len(res.trials)} in-sample trials", ""]
+    return [
+        f"## This run's {len(res.trials)} in-sample trials",
+        "",
+        f"The best is chosen from these only. Earlier runs on the same strategy and data tried "
+        f"{res.n_trials_prior} more parameter set(s), recorded in the trial ledger, and the deflated Sharpe ratio "
+        f"counts all {res.n_trials_total}.",
+        "",
+    ]
 
 
 def _params(p: dict) -> str:

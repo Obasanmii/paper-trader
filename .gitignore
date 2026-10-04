@@ -7,3 +7,4 @@ state/
 reports/
 data/raw/
 *.sqlite
+.DS_Store

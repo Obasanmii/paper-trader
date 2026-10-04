@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import numbers
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -114,3 +115,15 @@ class PortfolioSnapshot:
 
 def _valid_price(p) -> bool:
     return p is not None and math.isfinite(p) and p > 0
+
+
+def is_finite_number(value) -> bool:
+    """For limits built directly in Python, where nothing checks types: bool is an int
+    subclass, a NaN limit compares False against everything (so it never fires), and
+    math.isfinite overflows on huge ints."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False

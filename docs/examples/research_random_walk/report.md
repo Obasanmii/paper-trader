@@ -2,6 +2,8 @@
 
 Strategy `trend`. In-sample 2005-12-21 to 2016-12-30; out-of-sample 2017-01-02 to 2024-04-26.
 
+Trial ledger: 16 distinct parameter set(s) tried on this strategy and data so far; earlier runs had evaluated an overlapping out-of-sample period 0 time(s). This run is `20261004-173242-d0668b`.
+
 ![research](research.png)
 
 ## Verdict
@@ -9,9 +11,9 @@ Strategy `trend`. In-sample 2005-12-21 to 2016-12-30; out-of-sample 2017-01-02 t
 - Best of 16 in-sample trial(s): Sharpe -0.00, probabilistic Sharpe 0.50.
 - FAIL  Deflated for 16 trials, the in-sample result is consistent with luck (DSR 0.19, want >= 0.95).
 - FAIL  Out-of-sample Sharpe -0.06; 95% interval [-0.71, 0.52] includes zero.
-- PASS  Beat the benchmark's out-of-sample Sharpe (-0.15).
+- FAIL  Did not beat the benchmark out-of-sample: Sharpe difference +0.09, one-sided 95% lower bound -0.37 (want > 0; benchmark Sharpe -0.15).
 - FAIL  Timing does not beat randomly time-shifted copies of itself (p = 0.61).
-- Passed 1 of 4 checks. Treat the in-sample numbers as an upper bound, not an estimate.
+- Passed 0 of 4 checks. Treat the in-sample numbers as an upper bound, not an estimate.
 
 ## In-sample vs out-of-sample
 

@@ -2,7 +2,9 @@
 
 `process_day(t)` does, in this order:
   0. if the kill switch tripped since yesterday, cancel queued orders that add risk
-  1. OPEN   fill the orders queued yesterday at today's open        (broker)
+  1. OPEN   cancel queued orders that add risk if the open gapped
+            too far from their decision price (the price collar),
+            then fill the rest at today's open                      (risk -> broker)
   2. CLOSE  mark to market, then check loss limits                  (risk, may trip the kill switch)
   3. DECIDE read today's target weights, propose orders              (strategy -> portfolio)
             or, if the kill switch is tripped, propose flattening
@@ -24,6 +26,7 @@ from papertrader.core import OrderStatus
 from papertrader.engine.portfolio import orders_from_targets
 from papertrader.journal import Journal
 from papertrader.risk.manager import is_reducing
+from papertrader.utils import is_valid_price
 
 
 @dataclass
@@ -58,7 +61,13 @@ class TradingSession:
             else output.signals.reindex(index=data.dates, columns=self.symbols).to_numpy(dtype=float)
         )
         self.marks: dict[str, float] = {}  # last valid close per symbol
-        self.peak_equity: float | None = None
+
+    def _drawdown(self, equity: float) -> float:
+        """Against the risk manager's peak, the one the drawdown limit uses. It skips an
+        equity the gain limit didn't believe, so one bad mark can't inflate the journal's
+        drawdown for good (and the journal can't disagree with the limit)."""
+        peak = self.risk.peak_equity
+        return equity / peak - 1.0 if is_valid_price(peak) else 0.0
 
     def _row(self, arr, i) -> dict[str, float]:
         return {s: float(v) for s, v in zip(self.symbols, arr[i]) if math.isfinite(v) and v > 0}
@@ -79,8 +88,12 @@ class TradingSession:
                 lambda o: not is_reducing(held.get(o.symbol, 0.0), o.quantity), "kill switch active at the open"
             )
 
-        # 1. open
-        fills, open_cancels = self.broker.process_open(date, self._row(self._open, i))
+        # 1. open: the collar first, so an order the overnight gap turned into a different trade never fills
+        opens = self._row(self._open, i)
+        held = self.broker.snapshot({}).positions
+        for order, why in self.risk.check_open(self.broker.pending, held, opens):
+            cancelled += self.broker.cancel_pending(lambda o, oid=order.order_id: o.order_id == oid, why)
+        fills, open_cancels = self.broker.process_open(date, opens)
         cancelled += open_cancels
         for f in fills:
             j.log_fill(run, f)
@@ -118,9 +131,7 @@ class TradingSession:
                 j.log_order(run, order, date, "rejected", decision.reasons)
 
         # 5. record
-        self.peak_equity = equity if self.peak_equity is None else max(self.peak_equity, equity)
-        drawdown = equity / self.peak_equity - 1.0
-        j.log_equity(run, date, snap.cash, equity, snap.gross_exposure, snap.net_exposure, drawdown)
+        j.log_equity(run, date, snap.cash, equity, snap.gross_exposure, snap.net_exposure, self._drawdown(equity))
         return DayResult(
             date=date,
             cash=snap.cash,

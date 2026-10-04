@@ -5,6 +5,12 @@ order with the risk layer's verdict and reasons, every fill and cancel,
 every risk event, and end-of-day equity. Nothing is updated in place, so
 you can always answer "why did it do that?" after the fact.
 
+The one exception is `paper_state`: the paper account's current state (one
+row per account), kept here rather than in a separate file so it commits in
+the same transaction as the day's rows. A crash can then never leave a
+journal that is a day ahead of the account, which on retry would replay the
+day and log it twice.
+
     sqlite3 state/demo/journal.sqlite "select * from orders where event='rejected' limit 5"
 """
 from __future__ import annotations
@@ -35,6 +41,9 @@ CREATE TABLE IF NOT EXISTS risk_events (
 );
 CREATE TABLE IF NOT EXISTS equity (
     run_id TEXT, date TEXT, cash REAL, equity REAL, gross_exposure REAL, net_exposure REAL, drawdown REAL
+);
+CREATE TABLE IF NOT EXISTS paper_state (
+    state_dir TEXT PRIMARY KEY, state TEXT, updated_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_orders_run ON orders(run_id, date);
 CREATE INDEX IF NOT EXISTS idx_equity_run ON equity(run_id, date);
@@ -118,13 +127,86 @@ class Journal:
             [(run_id, _day(date), _num(cash), _num(equity), _num(gross), _num(net), _num(drawdown))],
         )
 
+    # ------------------------------------------------------------------ paper account state
+    # The column is still called state_dir; it holds the account's key (see PaperRunner.state_key).
+    def save_paper_state(self, key: str, state: dict) -> None:
+        """Part of the open transaction: it lands with the day's rows or not at all."""
+        if self.enabled:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO paper_state VALUES (?,?,?)",
+                (key, json.dumps(state, sort_keys=True, default=str), str(pd.Timestamp.now())),
+            )
+
+    def load_paper_state(self, key: str) -> dict | None:
+        if not self.enabled:
+            return None
+        row = self.conn.execute("SELECT state FROM paper_state WHERE state_dir = ?", (key,)).fetchone()
+        return None if row is None else json.loads(row[0])
+
+    def delete_paper_state(self, key: str) -> None:
+        if self.enabled:
+            self.conn.execute("DELETE FROM paper_state WHERE state_dir = ?", (key,))
+
+    def paper_state_keys(self) -> list[str]:
+        if not self.enabled:
+            return []
+        return [k for (k,) in self.conn.execute("SELECT state_dir FROM paper_state ORDER BY state_dir")]
+
+    def has_runs(self, mode: str) -> bool:
+        if not self.enabled:
+            return False
+        return self.conn.execute("SELECT 1 FROM runs WHERE mode = ? LIMIT 1", (mode,)).fetchone() is not None
+
+    @staticmethod
+    def read_paper_states(path: str | Path) -> dict[str, dict]:
+        """Every account in the journal, {key: state}, read-only (status): never creates or
+        upgrades the file. Empty if there is no journal, or no state in it yet; any other
+        error is raised, not read as "no state"."""
+        path = Path(path)
+        if not path.exists():
+            return {}
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            rows = conn.execute("SELECT state_dir, state FROM paper_state").fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
+            return {}  # a journal from before paper_state existed
+        finally:
+            conn.close()
+        return {key: json.loads(state) for key, state in rows}
+
+    # ------------------------------------------------------------------ transactions
+    def begin(self) -> None:
+        """Open the transaction now, holding SQLite's write lock (BEGIN IMMEDIATE) before
+        anything is read. Two writers that both got this far can then never act on the same
+        committed state: the second waits for the first to commit and reads its result, or
+        fails. (By default sqlite3 only begins at the first write, after the reads.)"""
+        if self.enabled:
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc):
+                    raise
+                raise RuntimeError(f"{self.path} is locked: another run may be in progress ({exc})") from exc
+
     def commit(self) -> None:
         if self.enabled:
             self.conn.commit()
 
-    def close(self) -> None:
+    def rollback(self) -> None:
+        if self.enabled:
+            self.conn.rollback()
+
+    def close(self, commit: bool = True) -> None:
+        """Backtests commit on close, even after an error (the rows up to it are what a
+        post-mortem needs). The paper runner passes commit=False: a half-processed day
+        must not be kept, or the retry would log it twice."""
         if self.enabled and self.conn is not None:
-            self.conn.commit()
+            if commit:
+                self.conn.commit()
+            else:
+                self.conn.rollback()
             self.conn.close()
             self.conn = None
             self.enabled = False

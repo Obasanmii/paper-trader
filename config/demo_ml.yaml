@@ -25,6 +25,7 @@ risk:
   max_order_notional: 250000
 
 research:
+  ledger_path: state/demo_ledger.sqlite  # the demos' own ledger: scripts/demo.sh resets it
   split_date: 2016-12-30
   param_grid:
     threshold: [0.52, 0.55, 0.58]

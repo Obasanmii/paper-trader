@@ -1,7 +1,6 @@
 """Backtests: the TradingSession run over a date range with a fresh account."""
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -109,17 +108,8 @@ def run_backtest(
     )
 
 
-def first_active_date(weights: pd.DataFrame):
-    active = weights.abs().sum(axis=1) > 0
-    return active.idxmax() if active.any() else None
-
-
 def evaluation_start(data, warmup_days: int):
     """The common start date every strategy is judged from."""
     if len(data) <= warmup_days:
         raise ValueError(f"need more than {warmup_days} days of data, have {len(data)}")
     return data.dates[warmup_days]
-
-
-def safe(x) -> float:
-    return x if isinstance(x, (int, float)) and math.isfinite(x) else math.nan

@@ -10,17 +10,19 @@ only works for free doesn't work.
 
 Cash: sells are processed before buys. Without margin, a buy that can't be
 afforded at the actual open (prices gap) is cut to what cash allows and
-recorded as a partial fill.
+recorded as a partial fill. The unfilled remainder comes back as a cancelled
+copy of the order (same order_id, the remainder as its quantity), so the
+journal shows where the rest of the order went instead of losing it.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import pandas as pd
 
-from papertrader.core import Fill, Order, OrderStatus, PortfolioSnapshot
+from papertrader.core import Fill, Order, OrderStatus, PortfolioSnapshot, is_finite_number
 from papertrader.execution.broker import Broker
 from papertrader.utils import is_valid_price
 
@@ -32,8 +34,11 @@ class CostModel:
     min_commission: float = 0.0
 
     def __post_init__(self):
-        if self.commission_bps < 0 or self.slippage_bps < 0 or self.min_commission < 0:
-            raise ValueError("costs can't be negative")
+        # Also built directly in Python: a NaN cost would turn every fill price and the cash balance into NaN.
+        for name in ("commission_bps", "slippage_bps", "min_commission"):
+            value = getattr(self, name)
+            if not is_finite_number(value) or value < 0:
+                raise ValueError(f"costs.{name} must be a finite number >= 0, got {value!r}")
 
 
 class SimulatedBroker(Broker):
@@ -107,7 +112,11 @@ class SimulatedBroker(Broker):
                 self.positions[order.symbol] = new_position
             self.total_commission += commission
             self.total_slippage += abs(qty) * abs(fill_px - px)
-            order.status = OrderStatus.FILLED if qty == order.quantity else OrderStatus.PARTIAL
+            if qty == order.quantity:
+                order.status = OrderStatus.FILLED
+            else:
+                order.status = OrderStatus.PARTIAL
+                cancels.append(_unfilled_remainder(order, qty))
             fills.append(Fill(order.order_id, order.symbol, qty, fill_px, commission, at))
         return fills, cancels
 
@@ -132,3 +141,10 @@ class SimulatedBroker(Broker):
         broker.total_commission = float(state.get("total_commission", 0.0))
         broker.total_slippage = float(state.get("total_slippage", 0.0))
         return broker
+
+
+def _unfilled_remainder(order: Order, filled: float) -> tuple[Order, str]:
+    """A partial fill's unfilled part, returned as its own cancellation so it can't vanish silently.
+    The original keeps its PARTIAL status; the copy shares its order_id so the journal ties them together."""
+    rest = replace(order, quantity=float(order.quantity) - filled, status=OrderStatus.CANCELLED)
+    return rest, f"insufficient cash: filled {filled:g} of {float(order.quantity):g}, remainder {rest.quantity:g} cancelled"
